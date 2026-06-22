@@ -94,44 +94,67 @@ class SEM_Image:
         except Exception as exc:
             raise RuntimeError(f"Could not read metadata: {exc}")
 
-    def scalebar_calc(self):
+    # "Nice" 1-2-5 step lengths (nm) spanning from the highest magnifications
+    # (sub-µm pixel size) down to the lowest (multi-µm/mm pixel size).
+    NICE_LENGTHS_NM = [
+        50, 100, 200, 500,
+        1_000, 2_000, 5_000,
+        10_000, 20_000, 50_000,
+        100_000, 200_000, 500_000,
+        1_000_000, 2_000_000, 5_000_000,
+        10_000_000, 20_000_000, 50_000_000,
+    ]
+
+    def scalebar_calc(self, max_pixels: float = None, target_pixels: float = 150):
+        """Pick the largest "nice" scalebar length that fits in max_pixels,
+        preferring one close to target_pixels wide."""
         ps = self.pixel_size
-        if ps < 3:
-            length = 200
-        elif ps < 6:
-            length = 500
-        elif ps < 10:
-            length = 1000
-        elif ps < 50:
-            length = 5000
-        elif ps < 100:
-            length = 10000
-        else:
-            length = 200000
-        self.scalebar_length = length
-        self.scalebar_pixels = length // ps
-        return self.scalebar_pixels, length
+        best_pixels, best_length = None, None
+        for length in self.NICE_LENGTHS_NM:
+            pixels = length / ps
+            if max_pixels is not None and pixels > max_pixels:
+                break
+            best_pixels, best_length = pixels, length
+            if pixels >= target_pixels:
+                break
+        if best_length is None:
+            # even the smallest nice length doesn't fit — use it anyway
+            best_length = self.NICE_LENGTHS_NM[0]
+            best_pixels = best_length / ps
+        self.scalebar_length = best_length
+        self.scalebar_pixels = best_pixels
+        return self.scalebar_pixels, self.scalebar_length
 
     def plot_scalebar(self, ax):
         image_cropped = self.imgarray[:685, :]
-        self.scalebar_pixels, self.scalebar_length = self.scalebar_calc()
-
         height, width = image_cropped.shape[:2]
-        scalebar_center_x = 100
+
+        # Fixed left margin (instead of a fixed center) so a long bar
+        # extends rightward from a safe anchor and can never be cropped
+        # off the left edge of the image.
+        margin = 40
+        max_bar_pixels = width - 2 * margin
+        self.scalebar_pixels, self.scalebar_length = self.scalebar_calc(max_bar_pixels)
+        self.scalebar_pixels = int(round(self.scalebar_pixels))
+
         scalebar_y = height - 80
-        scalebar_start_x = int(scalebar_center_x - self.scalebar_pixels / 2)
+        scalebar_start_x = margin
         scalebar_end_x = scalebar_start_x + self.scalebar_pixels
+        scalebar_center_x = (scalebar_start_x + scalebar_end_x) / 2
         text_center_y = scalebar_y + 50
 
         ax.imshow(image_cropped, cmap="gray")
 
         pad_x, pad_top, pad_bottom = 20, 35, 35
-        rect_x = scalebar_start_x - pad_x
-        rect_w = (scalebar_end_x - scalebar_start_x) + 2 * pad_x
-        rect_y = scalebar_y - pad_top
-        rect_h = (text_center_y - scalebar_y) + pad_top + pad_bottom
+        # Clamp the box to the image bounds — if it extended past the edges,
+        # its semi-transparent fill would blend with the axes' white
+        # background instead of the image, showing up as a visible line.
+        rect_x = max(scalebar_start_x - pad_x, 0)
+        rect_right = min(scalebar_end_x + pad_x, width)
+        rect_top = max(scalebar_y - pad_top, 0)
+        rect_bottom = min(text_center_y + pad_bottom, height)
         ax.add_patch(plt.Rectangle(
-            (rect_x, rect_y), rect_w, rect_h,
+            (rect_x, rect_top), rect_right - rect_x, rect_bottom - rect_top,
             facecolor="black", alpha=0.4, edgecolor="none", zorder=1,
         ))
 
@@ -141,11 +164,12 @@ class SEM_Image:
                   ymin=scalebar_y - 20, ymax=scalebar_y + 20,
                   color="white", linewidth=2, zorder=2)
 
-        label = (
-            f"{self.scalebar_length * 0.001:.0f} µm"
-            if self.scalebar_length >= 1000
-            else f"{self.scalebar_length} nm"
-        )
+        if self.scalebar_length >= 1_000_000:
+            label = f"{self.scalebar_length * 1e-6:.0f} mm"
+        elif self.scalebar_length >= 1_000:
+            label = f"{self.scalebar_length * 1e-3:.0f} µm"
+        else:
+            label = f"{self.scalebar_length:.0f} nm"
         ax.text(scalebar_center_x, text_center_y, label,
                 color="white", ha="center", va="center",
                 fontweight="bold", fontsize=16, zorder=2)
@@ -182,12 +206,21 @@ def resolve_out_path(fpath: str, output_dir: str, root_folder: str = None) -> st
     If root_folder is given, mirror fpath's position relative to root_folder
     under "{root_folder name}_png" inside output_dir, recreating subfolders.
     Otherwise drop the PNG flat into output_dir.
+
+    If output_dir itself already looks like a rendered tree (its name ends
+    with "_png" — e.g. the user picked a previous "{folder}_png" output as
+    the destination to re-render in place), mirror directly into output_dir
+    without nesting another "{root_folder name}_png" layer, and overwrite
+    existing files.
     """
     out_name = Path(fpath).stem + "_scalebar.png"
     if root_folder:
         root_path = Path(root_folder)
         rel_dir = Path(fpath).resolve().parent.relative_to(root_path.resolve())
-        out_dir = Path(output_dir) / f"{root_path.name}_png" / rel_dir
+        if Path(output_dir).name.lower().endswith("_png"):
+            out_dir = Path(output_dir) / rel_dir
+        else:
+            out_dir = Path(output_dir) / f"{root_path.name}_png" / rel_dir
         out_dir.mkdir(parents=True, exist_ok=True)
         return str(out_dir / out_name)
     return os.path.join(output_dir, out_name)
