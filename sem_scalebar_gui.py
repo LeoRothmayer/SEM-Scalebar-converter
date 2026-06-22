@@ -13,7 +13,7 @@ import os
 import re
 import traceback
 from pathlib import Path
-from typing import List
+from typing import Dict, List
 
 import numpy as np
 import matplotlib
@@ -24,7 +24,7 @@ from PIL import Image
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QListWidget, QListWidgetItem,
-    QProgressBar, QTextEdit, QSplitter, QFrame,
+    QProgressBar, QTextEdit, QSplitter, QFrame, QCheckBox,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QFont
@@ -124,11 +124,22 @@ class SEM_Image:
         text_center_y = scalebar_y + 50
 
         ax.imshow(image_cropped, cmap="gray")
+
+        pad_x, pad_top, pad_bottom = 20, 35, 35
+        rect_x = scalebar_start_x - pad_x
+        rect_w = (scalebar_end_x - scalebar_start_x) + 2 * pad_x
+        rect_y = scalebar_y - pad_top
+        rect_h = (text_center_y - scalebar_y) + pad_top + pad_bottom
+        ax.add_patch(plt.Rectangle(
+            (rect_x, rect_y), rect_w, rect_h,
+            facecolor="black", alpha=0.4, edgecolor="none", zorder=1,
+        ))
+
         ax.hlines(scalebar_y, scalebar_start_x, scalebar_end_x,
-                  color="white", linewidth=3)
+                  color="white", linewidth=3, zorder=2)
         ax.vlines([scalebar_start_x, scalebar_end_x],
                   ymin=scalebar_y - 20, ymax=scalebar_y + 20,
-                  color="white", linewidth=2)
+                  color="white", linewidth=2, zorder=2)
 
         label = (
             f"{self.scalebar_length * 0.001:.0f} µm"
@@ -137,8 +148,13 @@ class SEM_Image:
         )
         ax.text(scalebar_center_x, text_center_y, label,
                 color="white", ha="center", va="center",
-                fontweight="bold", fontsize=16)
+                fontweight="bold", fontsize=16, zorder=2)
         ax.axis("off")
+        # Lock limits to the image bounds — the rectangle patch can extend past
+        # the image edges (e.g. near x=0), which would otherwise make
+        # matplotlib autoscale the axes and reveal a white border.
+        ax.set_xlim(0, width)
+        ax.set_ylim(height, 0)
 
 
 # ── shared save helper ────────────────────────────────────────────────────────
@@ -153,6 +169,29 @@ def save_scalebar(sem: SEM_Image, out_path: str):
     fig.savefig(out_path, dpi=dpi, pad_inches=0)
     plt.close(fig)
 
+    # figsize-from-dpi math can round to one extra pixel of canvas, leaving a
+    # 1px white sliver at the edge — crop back to the exact image size.
+    with Image.open(out_path) as saved:
+        if saved.size != (w, h):
+            saved.crop((0, 0, w, h)).save(out_path)
+
+
+def resolve_out_path(fpath: str, output_dir: str, root_folder: str = None) -> str:
+    """Pick the destination PNG path for fpath.
+
+    If root_folder is given, mirror fpath's position relative to root_folder
+    under "{root_folder name}_png" inside output_dir, recreating subfolders.
+    Otherwise drop the PNG flat into output_dir.
+    """
+    out_name = Path(fpath).stem + "_scalebar.png"
+    if root_folder:
+        root_path = Path(root_folder)
+        rel_dir = Path(fpath).resolve().parent.relative_to(root_path.resolve())
+        out_dir = Path(output_dir) / f"{root_path.name}_png" / rel_dir
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return str(out_dir / out_name)
+    return os.path.join(output_dir, out_name)
+
 
 # ── worker thread ─────────────────────────────────────────────────────────────
 class ProcessWorker(QThread):
@@ -160,10 +199,12 @@ class ProcessWorker(QThread):
     log      = pyqtSignal(str, str)  # message, level ("info"|"error"|"ok")
     finished = pyqtSignal(int, int)  # ok_count, error_count
 
-    def __init__(self, file_list: List[str], output_dir: str):
+    def __init__(self, file_list: List[str], output_dir: str,
+                 file_roots: Dict[str, str] = None):
         super().__init__()
         self.file_list  = file_list
         self.output_dir = output_dir
+        self.file_roots = file_roots or {}
 
     def run(self):
         total     = len(self.file_list)
@@ -175,10 +216,11 @@ class ProcessWorker(QThread):
             fname = Path(fpath).name
             try:
                 sem      = SEM_Image(fpath)
-                out_name = Path(fpath).stem + "_scalebar.png"
-                out_path = os.path.join(self.output_dir, out_name)
+                out_path = resolve_out_path(
+                    fpath, self.output_dir, self.file_roots.get(fpath)
+                )
                 save_scalebar(sem, out_path)
-                self.log.emit(f"✓  {fname}  →  {out_name}", "ok")
+                self.log.emit(f"✓  {fname}  →  {out_path}", "ok")
                 ok_count += 1
             except Exception:
                 detail = traceback.format_exc().splitlines()[-1]
@@ -195,6 +237,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("SEM Scalebar Renderer")
         self.setMinimumSize(820, 580)
         self.file_list: List[str] = []
+        self.file_roots: Dict[str, str] = {}
         self.output_dir: str = ""
         self._build_ui()
 
@@ -230,6 +273,12 @@ class MainWindow(QMainWindow):
         self.lbl_output.setStyleSheet("color: #888; font-size: 11px;")
         self.lbl_output.setWordWrap(True)
         root.addWidget(self.lbl_output)
+
+        self.chk_mirror = QCheckBox(
+            "Mirror folder structure  (creates \"{folder}_png\" in the output "
+            "folder, replicating all subfolders)"
+        )
+        root.addWidget(self.chk_mirror)
 
         # splitter: file list | log
         splitter = QSplitter(Qt.Horizontal)
@@ -301,13 +350,17 @@ class MainWindow(QMainWindow):
             save_last_dir(os.path.dirname(folders[0]))
 
         found: List[str] = []
+        roots: Dict[str, str] = {}
         for folder in folders:
             for dirpath, _, files in os.walk(folder):
                 for f in files:
                     if f.lower().endswith(".tif"):
-                        found.append(os.path.join(dirpath, f))
+                        fpath = os.path.join(dirpath, f)
+                        found.append(fpath)
+                        roots[fpath] = folder
 
         self.file_list = found
+        self.file_roots = roots
         self._refresh_file_list()
 
     def _refresh_file_list(self):
@@ -339,11 +392,11 @@ class MainWindow(QMainWindow):
         fpath = item.toolTip()
         fname = Path(fpath).name
         try:
-            sem      = SEM_Image(fpath)
-            out_name = Path(fpath).stem + "_scalebar.png"
-            out_path = os.path.join(self.output_dir, out_name)
+            sem = SEM_Image(fpath)
+            root_folder = self.file_roots.get(fpath) if self.chk_mirror.isChecked() else None
+            out_path = resolve_out_path(fpath, self.output_dir, root_folder)
             save_scalebar(sem, out_path)
-            self._append_log(f"✓  {fname}  →  {out_name}", "ok")
+            self._append_log(f"✓  {fname}  →  {out_path}", "ok")
         except Exception:
             detail = traceback.format_exc().splitlines()[-1]
             self._append_log(f"✗  {fname}  —  {detail}", "error")
@@ -359,7 +412,8 @@ class MainWindow(QMainWindow):
         self.btn_select.setEnabled(False)
         self.btn_output.setEnabled(False)
 
-        self.worker = ProcessWorker(self.file_list, self.output_dir)
+        file_roots = self.file_roots if self.chk_mirror.isChecked() else {}
+        self.worker = ProcessWorker(self.file_list, self.output_dir, file_roots)
         self.worker.progress.connect(self.progress_bar.setValue)
         self.worker.log.connect(self._append_log)
         self.worker.finished.connect(self._on_finished)
